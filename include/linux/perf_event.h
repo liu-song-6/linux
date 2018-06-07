@@ -695,6 +695,12 @@ struct perf_event {
 #endif
 
 	struct list_head		sb_list;
+
+	/* for PMU sharing */
+	struct perf_event		*tmp_master;
+	u64				dup_id;
+	u64				dup_base_count;
+	u64				dup_base_child_count;
 #endif /* CONFIG_PERF_EVENTS */
 };
 
@@ -704,6 +710,58 @@ struct perf_event_groups {
 	u64		index;
 };
 
+/*
+ * Sharing PMU across compatible events
+ *
+ * If two perf_events in the same perf_event_context are counting same
+ * hardware events (instructions, cycles, etc.), they could share the
+ * hardware PMU counter.
+ *
+ * When a perf_event is added to the ctx (list_add_event), it is compared
+ * against other events in the ctx. If they can share the PMU counter,
+ * a perf_event_dup is allocated to represent the sharing.
+ *
+ * Each perf_event_dup has a virtual master event, which is called by
+ * pmu->add() and pmu->del(). We cannot call perf_event_alloc() in
+ * list_add_event(), so it is allocated and carried by event->tmp_master
+ * into list_add_event().
+ *
+ * Virtual master in different cases/paths:
+ *
+ * < I > perf_event_open() -> close() path:
+ *
+ * 1. Allocated by perf_event_alloc() in sys_perf_event_open();
+ * 2. event->tmp_master->ctx assigned in perf_install_in_context();
+ * 3.a. if used by ctx->dup_events, freed in perf_event_release_kernel();
+ * 3.b. if not used by ctx->dup_events, freed in perf_event_open().
+ *
+ * < II > inherit_event() path:
+ *
+ * 1. Allocated by perf_event_alloc() in inherit_event();
+ * 2. tmp_master->ctx assigned in inherit_event();
+ * 3.a. if used by ctx->dup_events, freed in perf_event_release_kernel();
+ * 3.b. if not used by ctx->dup_events, freed in inherit_event().
+ *
+ * < III > perf_pmu_migrate_context() path:
+ * all dup_events removed during migration (no sharing after the move).
+ *
+ * < IV > perf_event_create_kernel_counter() path:
+ * not supported yet.
+ */
+struct perf_event_dup {
+	/*
+	 * master event being called by pmu->add() and pmu->del().
+	 * This event is allocated with perf_event_alloc(). When
+	 * attached to a ctx, this event should hold ctx->refcount.
+	 */
+	struct perf_event       *master;
+	/* number of events in the ctx that shares the master */
+	int			total_event_count;
+	/* number of active events of the master */
+	int			active_event_count;
+};
+
+#define MAX_PERF_EVENT_DUP_PER_CTX 4
 /**
  * struct perf_event_context - event context structure
  *
@@ -759,6 +817,9 @@ struct perf_event_context {
 #endif
 	void				*task_ctx_data; /* pmu specific data */
 	struct rcu_head			rcu_head;
+
+	/* for PMU sharing. array is needed for O(1) access */
+	struct perf_event_dup		dup_events[MAX_PERF_EVENT_DUP_PER_CTX];
 };
 
 /*
