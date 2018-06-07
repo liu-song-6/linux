@@ -1657,6 +1657,135 @@ perf_event_groups_next(struct perf_event *event)
 		event = rb_entry_safe(rb_next(&event->group_node),	\
 				typeof(*event), group_node))
 
+/* Returns whether a perf_event can share PMU counter with other events */
+static inline bool perf_event_can_share(struct perf_event *event)
+{
+	/* only do sharing for hardware events */
+	if (is_software_event(event))
+		return false;
+
+	/* limit sharing to counting events. */
+	if (is_sampling_event(event))
+		return false;
+
+	return true;
+}
+
+/*
+ * Returns whether the two events can share a PMU counter.
+ *
+ * Note: This function does NOT check perf_event_can_share() for
+ * the two events, they should be checked before this function
+ */
+static inline bool perf_event_compatible(struct perf_event *event_a,
+					 struct perf_event *event_b)
+{
+	return event_a->attr.type == event_b->attr.type &&
+		event_a->attr.config == event_b->attr.config &&
+		event_a->attr.config1 == event_b->attr.config1 &&
+		event_a->attr.config2 == event_b->attr.config2;
+}
+
+/* prepare the dup_master, this event is its own dup_master */
+static void perf_event_init_dup_master(struct perf_event *event)
+{
+	event->dup_master = event;
+	/*
+	 * dup_master->count is used by the hw PMC, and shared with other
+	 * events, so we have to read from dup_master->master_count.
+	 * Same logic for child_count and master_child_count.
+	 */
+	local64_set(&event->master_count, local64_read(&event->count));
+	atomic64_set(&event->master_child_count,
+		     atomic64_read(&event->child_count));
+
+	event->dup_active_count = 0;
+}
+
+/* tear down dup_master, no more sharing for this event */
+static void perf_event_exit_dup_master(struct perf_event *event)
+{
+	event->dup_master = NULL;
+	/* restore event->count and event->child_count */
+	local64_set(&event->count, local64_read(&event->master_count));
+	atomic64_set(&event->child_count,
+		     atomic64_read(&event->master_child_count));
+}
+
+/* After adding a event to the ctx, try find compatible event(s). */
+static inline void perf_event_setup_dup(struct perf_event *event,
+					struct perf_event_context *ctx)
+
+{
+	struct perf_event *tmp;
+
+	if (!perf_event_can_share(event))
+		return;
+
+	/* look for dup with other events */
+	list_for_each_entry(tmp, &ctx->event_list, event_entry) {
+		WARN_ON_ONCE(event->state > PERF_EVENT_STATE_INACTIVE);
+
+		if (tmp == event ||
+		    !perf_event_can_share(tmp) ||
+		    !perf_event_compatible(event, tmp))
+			continue;
+
+		/* first dup, pick tmp as the master */
+		if (!tmp->dup_master)
+			perf_event_init_dup_master(tmp);
+
+		event->dup_master = tmp->dup_master;
+		break;
+	}
+}
+
+/* Remove the event from ctx->dup_events. */
+static void perf_event_remove_dup(struct perf_event *event,
+				  struct perf_event_context *ctx)
+
+{
+	struct perf_event *tmp, *new_master;
+	int count;
+
+	WARN_ON_ONCE(event->state > PERF_EVENT_STATE_INACTIVE);
+
+	if (!event->dup_master)
+		return;
+
+	if (event->dup_master != event) {
+		event->dup_master = NULL;
+		return;
+	}
+
+	/* this event is the master */
+	perf_event_exit_dup_master(event);
+	count = 0;
+	new_master = NULL;
+	list_for_each_entry(tmp, &ctx->event_list, event_entry) {
+		if (tmp->dup_master == event) {
+			count++;
+			if (!new_master)
+				new_master = tmp;
+		}
+	}
+
+	if (!count)
+		return;
+
+	if (count == 1) {
+		/* no more sharing */
+		new_master->dup_master = NULL;
+		return;
+	}
+
+	perf_event_init_dup_master(new_master);
+
+	list_for_each_entry(tmp, &ctx->event_list, event_entry)
+		if (tmp->dup_master == event)
+			tmp->dup_master = new_master;
+}
+
 /*
  * Add an event from the lists for its context.
  * Must be called with ctx->mutex and ctx->lock held.
@@ -1689,6 +1818,7 @@ list_add_event(struct perf_event *event, struct perf_event_context *ctx)
 		ctx->nr_stat++;
 
 	ctx->generation++;
+	perf_event_setup_dup(event, ctx);
 }
 
 /*
@@ -2069,17 +2199,106 @@ event_filter_match(struct perf_event *event)
 	       perf_cgroup_match(event) && pmu_filter_match(event);
 }
 
+/* PMU sharing aware version of event->pmu->add() */
+static int event_pmu_add(struct perf_event *event,
+			 struct perf_event_context *ctx)
+{
+	struct perf_event *master;
+	int ret;
+
+	/* no sharing, just do event->pmu->add() */
+	if (!event->dup_master)
+		return event->pmu->add(event, PERF_EF_START);
+
+	master = event->dup_master;
+
+	if (!master->dup_active_count) {
+		ret = event->pmu->add(master, PERF_EF_START);
+		if (ret)
+			return ret;
+
+		if (master != event)
+			perf_event_set_state(master, PERF_EVENT_STATE_ENABLED);
+	}
+
+	master->dup_active_count++;
+	master->pmu->read(master);
+	event->dup_base_count = local64_read(&master->count);
+	event->dup_base_child_count = atomic64_read(&master->child_count);
+	return 0;
+}
+
+/*
+ * sync data count from dup->master to event, called on event_pmu_read()
+ * and event_pmu_del()
+ */
+static void event_sync_dup_count(struct perf_event *event,
+				 struct perf_event *master)
+{
+	u64 new_count;
+	u64 new_child_count;
+
+	event->pmu->read(master);
+	new_count = local64_read(&master->count);
+	new_child_count = atomic64_read(&master->child_count);
+
+	if (event != master) {
+		local64_add(new_count - event->dup_base_count, &event->count);
+		atomic64_add(new_child_count - event->dup_base_child_count,
+			     &event->child_count);
+	} else {
+		local64_add(new_count - event->dup_base_count,
+			    &event->master_count);
+		atomic64_add(new_child_count - event->dup_base_child_count,
+			     &event->master_child_count);
+	}
+
+	event->dup_base_count = new_count;
+	event->dup_base_child_count = new_child_count;
+}
+
+/* PMU sharing aware version of event->pmu->del() */
+static void event_pmu_del(struct perf_event *event,
+			  struct perf_event_context *ctx)
+{
+	struct perf_event *master;
+
+	if (event->dup_master == NULL) {
+		event->pmu->del(event, 0);
+		return;
+	}
+
+	master = event->dup_master;
+	event_sync_dup_count(event, master);
+	if (--master->dup_active_count == 0) {
+		event->pmu->del(master, 0);
+		perf_event_set_state(master, PERF_EVENT_STATE_INACTIVE);
+	} else if (master == event) {
+		perf_event_set_state(master, PERF_EVENT_STATE_ENABLED);
+	}
+}
+
+/* PMU sharing aware version of event->pmu->read() */
+static void event_pmu_read(struct perf_event *event)
+{
+	if (event->dup_master == NULL) {
+		event->pmu->read(event);
+		return;
+	}
+	event_sync_dup_count(event, event->dup_master);
+}
+
 static void
 event_sched_out(struct perf_event *event,
-		  struct perf_cpu_context *cpuctx,
-		  struct perf_event_context *ctx)
+		struct perf_cpu_context *cpuctx,
+		struct perf_event_context *ctx)
 {
 	enum perf_event_state state = PERF_EVENT_STATE_INACTIVE;
 
 	WARN_ON_ONCE(event->ctx != ctx);
 	lockdep_assert_held(&ctx->lock);
 
-	if (event->state != PERF_EVENT_STATE_ACTIVE)
+	if (event->state <= PERF_EVENT_STATE_INACTIVE)
 		return;
 
 	/*
@@ -2091,9 +2310,11 @@ event_sched_out(struct perf_event *event,
 
 	perf_pmu_disable(event->pmu);
 
-	event->pmu->del(event, 0);
+	event_pmu_del(event, ctx);
 	event->oncpu = -1;
 
+	if (event->dup_master)
+		event_sync_dup_count(event, event->dup_master);
 	if (READ_ONCE(event->pending_disable) >= 0) {
 		WRITE_ONCE(event->pending_disable, -1);
 		state = PERF_EVENT_STATE_OFF;
@@ -2104,6 +2325,7 @@ event_sched_out(struct perf_event *event,
 		cpuctx->active_oncpu--;
 	if (!--ctx->nr_active)
 		perf_event_ctx_deactivate(ctx);
+
 	if (event->attr.freq && event->attr.sample_freq)
 		ctx->nr_freq--;
 	if (event->attr.exclusive || !cpuctx->active_oncpu)
@@ -2140,6 +2362,14 @@ group_sched_out(struct perf_event *group_event,
 
 #define DETACH_GROUP	0x01UL
 
+static void ctx_sched_out(struct perf_event_context *ctx,
+			  struct perf_cpu_context *cpuctx,
+			  enum event_type_t event_type);
+
+static void ctx_resched(struct perf_cpu_context *cpuctx,
+			struct perf_event_context *task_ctx,
+			enum event_type_t event_type);
+
 /*
  * Cross CPU call to remove a performance event
  *
@@ -2153,16 +2383,23 @@ __perf_remove_from_context(struct perf_event *event,
 			   void *info)
 {
 	unsigned long flags = (unsigned long)info;
+	bool resched = (event->dup_master == event);
 
 	if (ctx->is_active & EVENT_TIME) {
 		update_context_time(ctx);
 		update_cgrp_time_from_cpuctx(cpuctx);
 	}
 
-	event_sched_out(event, cpuctx, ctx);
+	if (resched)
+		ctx_sched_out(ctx, cpuctx, EVENT_ALL);
+	else
+		event_sched_out(event, cpuctx, ctx);
+
 	if (flags & DETACH_GROUP)
 		perf_group_detach(event);
 	list_del_event(event, ctx);
+	if (resched)
+		ctx_resched(cpuctx, ctx, EVENT_ALL);
 
 	if (!ctx->nr_events && ctx->is_active) {
 		ctx->is_active = 0;
@@ -2218,15 +2455,23 @@ static void __perf_event_disable(struct perf_event *event,
 				 struct perf_event_context *ctx,
 				 void *info)
 {
+	bool is_dup_master;
+
 	if (event->state < PERF_EVENT_STATE_INACTIVE)
 		return;
 
+	is_dup_master = (event->dup_master == event);
 	if (ctx->is_active & EVENT_TIME) {
 		update_context_time(ctx);
 		update_cgrp_time_from_event(event);
 	}
 
-	if (event == event->group_leader)
+	if (is_dup_master) {
+		ctx_sched_out(ctx, cpuctx, EVENT_ALL);
+		perf_event_set_state(event, PERF_EVENT_STATE_OFF);
+		perf_event_remove_dup(event, ctx);
+		ctx_resched(cpuctx, cpuctx->task_ctx, EVENT_ALL);
+	} else if (event == event->group_leader)
 		group_sched_out(event, cpuctx, ctx);
 	else
 		event_sched_out(event, cpuctx, ctx);
@@ -2364,7 +2609,7 @@ event_sched_in(struct perf_event *event,
 
 	perf_log_itrace_start(event);
 
-	if (event->pmu->add(event, PERF_EF_START)) {
+	if (event_pmu_add(event, ctx)) {
 		perf_event_set_state(event, PERF_EVENT_STATE_INACTIVE);
 		event->oncpu = -1;
 		ret = -EAGAIN;
@@ -2478,9 +2723,6 @@ static void add_event_to_ctx(struct perf_event *event,
 	perf_group_attach(event);
 }
 
-static void ctx_sched_out(struct perf_event_context *ctx,
-			  struct perf_cpu_context *cpuctx,
-			  enum event_type_t event_type);
 static void
 ctx_sched_in(struct perf_event_context *ctx,
 	     struct perf_cpu_context *cpuctx,
@@ -2625,9 +2867,10 @@ static int  __perf_install_in_context(void *info)
 #endif
 
 	if (reprogram) {
-		ctx_sched_out(ctx, cpuctx, EVENT_TIME);
+		/* schedule out all events to set up dup properly */
+		ctx_sched_out(ctx, cpuctx, EVENT_ALL);
 		add_event_to_ctx(event, ctx);
-		ctx_resched(cpuctx, task_ctx, get_event_type(event));
+		ctx_resched(cpuctx, task_ctx, EVENT_ALL);
 	} else {
 		add_event_to_ctx(event, ctx);
 	}
@@ -2767,7 +3010,7 @@ static void __perf_event_enable(struct perf_event *event,
 	 * If the event is in a group and isn't the group leader,
 	 * then don't put it on unless the group is on.
 	 */
-	if (leader != event && leader->state != PERF_EVENT_STATE_ACTIVE) {
+	if (leader != event && leader->state <= PERF_EVENT_STATE_INACTIVE) {
 		ctx_sched_in(ctx, cpuctx, EVENT_TIME, current);
 		return;
 	}
@@ -3115,7 +3358,7 @@ static void __perf_event_sync_stat(struct perf_event *event,
 	 * don't need to use it.
 	 */
 	if (event->state == PERF_EVENT_STATE_ACTIVE)
-		event->pmu->read(event);
+		event_pmu_read(event);
 
 	perf_event_update_time(event);
 
@@ -3979,14 +4222,14 @@ static void __perf_event_read(void *info)
 		goto unlock;
 
 	if (!data->group) {
-		pmu->read(event);
+		event_pmu_read(event);
 		data->ret = 0;
 		goto unlock;
 	}
 
 	pmu->start_txn(pmu, PERF_PMU_TXN_READ);
 
-	pmu->read(event);
+	event_pmu_read(event);
 
 	for_each_sibling_event(sub, event) {
 		if (sub->state == PERF_EVENT_STATE_ACTIVE) {
@@ -3994,7 +4237,7 @@ static void __perf_event_read(void *info)
 			 * Use sibling's PMU rather than @event's since
 			 * sibling could be on different (eg: software) PMU.
 			 */
-			sub->pmu->read(sub);
+			event_pmu_read(sub);
 		}
 	}
 
@@ -4006,6 +4249,9 @@ unlock:
 
 static inline u64 perf_event_count(struct perf_event *event)
 {
+	if (event->dup_master == event)
+		return local64_read(&event->master_count) +
+			atomic64_read(&event->master_child_count);
 	return local64_read(&event->count) + atomic64_read(&event->child_count);
 }
 
@@ -4064,9 +4310,12 @@ int perf_event_read_local(struct perf_event *event, u64 *value,
 	 * oncpu == -1).
 	 */
 	if (event->oncpu == smp_processor_id())
-		event->pmu->read(event);
+		event_pmu_read(event);
 
-	*value = local64_read(&event->count);
+	if (event->dup_master == event)
+		*value = local64_read(&event->master_count);
+	else
+		*value = local64_read(&event->count);
 	if (enabled || running) {
 		u64 now = event->shadow_ctx_time + perf_clock();
 		u64 __enabled, __running;
@@ -6288,7 +6537,7 @@ static void perf_output_read_group(struct perf_output_handle *handle,
 
 	if ((leader != event) &&
 	    (leader->state == PERF_EVENT_STATE_ACTIVE))
-		leader->pmu->read(leader);
+		event_pmu_read(leader);
 
 	values[n++] = perf_event_count(leader);
 	if (read_format & PERF_FORMAT_ID)
@@ -6301,7 +6550,7 @@ static void perf_output_read_group(struct perf_output_handle *handle,
 
 		if ((sub != event) &&
 		    (sub->state == PERF_EVENT_STATE_ACTIVE))
-			sub->pmu->read(sub);
+			event_pmu_read(sub);
 
 		values[n++] = perf_event_count(sub);
 		if (read_format & PERF_FORMAT_ID)
@@ -9566,7 +9815,7 @@ static enum hrtimer_restart perf_swevent_hrtimer(struct hrtimer *hrtimer)
 	if (event->state != PERF_EVENT_STATE_ACTIVE)
 		return HRTIMER_NORESTART;
 
-	event->pmu->read(event);
+	event_pmu_read(event);
 
 	perf_sample_data_init(&data, 0, event->hw.last_period);
 	regs = get_irq_regs();
@@ -10456,7 +10705,7 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
 	event->ns		= get_pid_ns(task_active_pid_ns(current));
 	event->id		= atomic64_inc_return(&perf_event_id);
 
-	event->state		= PERF_EVENT_STATE_INACTIVE;
+	event->state	= PERF_EVENT_STATE_INACTIVE;
 
 	if (task) {
 		event->attach_state = PERF_ATTACH_TASK;
@@ -11202,9 +11451,17 @@ SYSCALL_DEFINE5(perf_event_open,
 		perf_remove_from_context(group_leader, 0);
 		put_ctx(gctx);
 
+		/*
+		 * move_group only happens to sw events, from sw ctx to hw
+		 * ctx. The sw events should not have valid dup_master. So
+		 * it is not necessary to handle dup_events.
+		 */
+		WARN_ON_ONCE(group_leader->dup_master);
+
 		for_each_sibling_event(sibling, group_leader) {
 			perf_remove_from_context(sibling, 0);
 			put_ctx(gctx);
+			WARN_ON_ONCE(sibling->dup_master);
 		}
 
 		/*
@@ -11778,7 +12035,6 @@ inherit_event(struct perf_event *parent_event,
 	if (IS_ERR(child_event))
 		return child_event;
 
-
 	if ((child_event->attach_state & PERF_ATTACH_TASK_DATA) &&
 	    !child_ctx->task_ctx_data) {
 		struct pmu *pmu = child_event->pmu;
@@ -11832,6 +12088,10 @@ inherit_event(struct perf_event *parent_event,
 	child_event->overflow_handler = parent_event->overflow_handler;
 	child_event->overflow_handler_context
 		= parent_event->overflow_handler_context;
+	if (child_event->dup_master) {
+		child_event->dup_master->ctx = child_ctx;
+		get_ctx(child_ctx);
+	}
 
 	/*
 	 * Precalculate sample_data sizes

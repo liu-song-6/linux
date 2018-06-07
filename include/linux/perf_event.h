@@ -522,7 +522,9 @@ enum perf_event_state {
 	PERF_EVENT_STATE_ERROR		= -2,
 	PERF_EVENT_STATE_OFF		= -1,
 	PERF_EVENT_STATE_INACTIVE	=  0,
-	PERF_EVENT_STATE_ACTIVE		=  1,
+	/* the hw PMC is enabled, but this event is not counting */
+	PERF_EVENT_STATE_ENABLED	=  1,
+	PERF_EVENT_STATE_ACTIVE		=  2,
 };
 
 struct file;
@@ -722,6 +724,15 @@ struct perf_event {
 #endif
 
 	struct list_head		sb_list;
+
+	/* for PMU sharing */
+	struct perf_event		*dup_master;
+	u64				dup_base_count;
+	u64				dup_base_child_count;
+	/* master only */
+	local64_t			master_count;
+	atomic64_t			master_child_count;
+	int				dup_active_count;
 #endif /* CONFIG_PERF_EVENTS */
 };
 
@@ -730,6 +741,45 @@ struct perf_event_groups {
 	struct rb_root	tree;
 	u64		index;
 };
+
+/*
+ * Sharing PMU across compatible events
+ *
+ * If two perf_events in the same perf_event_context are counting same
+ * hardware events (instructions, cycles, etc.), they could share the
+ * hardware PMU counter.
+ *
+ * When a perf_event is added to the ctx (list_add_event), it is compared
+ * against other events in the ctx. If they can share the PMU counter,
+ * a perf_event_dup is allocated to represent the sharing.
+ *
+ * Each perf_event_dup has a virtual master event, which is called by
+ * pmu->add() and pmu->del(). We cannot call perf_event_alloc() in
+ * list_add_event(), so it is allocated and carried by event->tmp_master
+ * into list_add_event().
+ *
+ * Virtual master in different cases/paths:
+ *
+ * < I > perf_event_open() -> close() path:
+ *
+ * 1. Allocated by perf_event_alloc() in sys_perf_event_open();
+ * 2. event->tmp_master->ctx assigned in perf_install_in_context();
+ * 3.a. if used by ctx->dup_events, freed in perf_event_release_kernel();
+ * 3.b. if not used by ctx->dup_events, freed in perf_event_open().
+ *
+ * < II > inherit_event() path:
+ *
+ * 1. Allocated by perf_event_alloc() in inherit_event();
+ * 2. tmp_master->ctx assigned in inherit_event();
+ * 3.a. if used by ctx->dup_events, freed in perf_event_release_kernel();
+ * 3.b. if not used by ctx->dup_events, freed in inherit_event().
+ *
+ * < III > perf_pmu_migrate_context() path:
+ * all dup_events removed during migration (no sharing after the move).
+ *
+ * < IV > perf_event_create_kernel_counter() path:
+ * not supported yet.
+ */
 
 /**
  * struct perf_event_context - event context structure
