@@ -137,7 +137,7 @@ $(OUTPUT)/%.o: %.c
 		 -O2 -target bpf -emit-llvm -c $< -o - |      \
 	$(LLC) -march=bpf -mcpu=$(CPU) $(LLC_FLAGS) -filetype=obj -o $@
 ifeq ($(DWARF2BTF),y)
-	$(BTF_PAHOLE) -J $@
+#	$(BTF_PAHOLE) -J $@
 endif
 
 EXTRA_CLEAN := $(TEST_CUSTOM_PROGS)
