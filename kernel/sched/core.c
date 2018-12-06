@@ -6579,14 +6579,17 @@ const u64 min_cfs_quota_period = 1 * NSEC_PER_MSEC; /* 1ms */
 static int __cfs_schedulable(struct task_group *tg, u64 period, u64 runtime);
 
 /* need get_online_cpus() and hold cfs_constraints_mutex */
-static void tg_switch_cfs_runtime(struct task_group *tg, u64 period, u64 quota)
+static void tg_switch_cfs_runtime(struct task_group *tg, u64 period, u64 quota,
+				  unsigned long target_idle_pct,
+				  unsigned long min_runtime_pct)
 {
 	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
 	int runtime_enabled, runtime_was_enabled;
 	int i;
 
-	runtime_enabled = quota != RUNTIME_INF;
-	runtime_was_enabled = cfs_b->quota != RUNTIME_INF;
+	runtime_enabled = (quota != RUNTIME_INF) || (target_idle_pct != 0);
+	runtime_was_enabled = (cfs_b->quota != RUNTIME_INF) ||
+		(cfs_b->target_idle_pct != 0);
 	/*
 	 * If we need to toggle cfs_bandwidth_used, off->on must occur
 	 * before making related changes, and on->off must occur afterwards
@@ -6596,6 +6599,8 @@ static void tg_switch_cfs_runtime(struct task_group *tg, u64 period, u64 quota)
 	raw_spin_lock_irq(&cfs_b->lock);
 	cfs_b->period = ns_to_ktime(period);
 	cfs_b->quota = quota;
+	cfs_b->target_idle_pct = target_idle_pct;
+	cfs_b->min_runtime_pct = min_runtime_pct;
 
 	__refill_cfs_bandwidth_runtime(cfs_b);
 
@@ -6653,7 +6658,9 @@ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
 	mutex_lock(&cfs_constraints_mutex);
 	ret = __cfs_schedulable(tg, period, quota);
 	if (!ret)
-		tg_switch_cfs_runtime(tg, period, quota);
+		tg_switch_cfs_runtime(tg, period, quota,
+				      tg->cfs_bandwidth.target_idle_pct,
+				      tg->cfs_bandwidth.min_runtime_pct);
 
 	mutex_unlock(&cfs_constraints_mutex);
 	put_online_cpus();
@@ -7042,6 +7049,375 @@ static ssize_t cpu_max_write(struct kernfs_open_file *of,
 		ret = tg_set_cfs_bandwidth(tg, period, quota);
 	return ret ?: nbytes;
 }
+
+/*
+ * Configure headroom, down pass, cap children's allowed value with
+ * parent's values:
+ *
+ *   allowed_headroom_pct = min(configured_headroom_pct,
+ *                              parent->allowed_headroom_pct);
+ *   allowed_throttle_pct = max(configured_throttle_pct,
+ *                              parent->allowed_throttle_pct);
+ */
+static int cpu_headroom_configure_down(struct task_group *tg, void *data)
+{
+	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+
+	/* skip non-cgroup task_group and root cgroup */
+	if (!tg->css.cgroup || !tg->parent)
+		return 0;
+
+	raw_spin_lock_irq(&cfs_b->lock);
+	cfs_b->allowed_headroom_pct =
+		min_t(unsigned long, cfs_b->configured_headroom_pct,
+		      tg->parent->cfs_bandwidth.allowed_headroom_pct);
+	cfs_b->allowed_throttle_pct =
+		max_t(unsigned long, cfs_b->configured_throttle_pct,
+		      tg->parent->cfs_bandwidth.allowed_throttle_pct);
+	raw_spin_unlock_irq(&cfs_b->lock);
+	return 0;
+}
+
+/*
+ * Configure headroom, up pass, calculate effective values only for
+ * populated cgroups:
+ *   if (cgroup has tasks) {
+ *        effective_headroom_pct = allowed_headroom_pct
+ *        effective_throttle_pct = allowed_throttle_pct
+ *   } else {
+ *        effective_headroom_pct =  max(children's effective_headroom_pct)
+ *        effective_throttle_pct =  min(children's effective_throttle_pct)
+ *   }
+ */
+static int cpu_headroom_configure_up(struct task_group *tg, void *data)
+{
+	struct cfs_bandwidth *cfs_b_p;
+
+	/* skip non-cgroup task_group and root cgroup */
+	if (!tg->css.cgroup || !tg->parent)
+		return 0;
+
+	cfs_b_p = &tg->cfs_bandwidth;
+
+	if (tg->css.cgroup->nr_populated_csets > 0) {
+		cfs_b_p->effective_headroom_pct = cfs_b_p->allowed_headroom_pct;
+		cfs_b_p->effective_throttle_pct = cfs_b_p->allowed_throttle_pct;
+	} else {
+		struct task_group *child;
+
+		cfs_b_p->effective_headroom_pct = 0;
+		cfs_b_p->effective_throttle_pct = CFS_BANDWIDTH_MAX_HEADROOM;
+
+		list_for_each_entry_rcu(child, &tg->children, siblings) {
+			struct cfs_bandwidth *cfs_b_c = &child->cfs_bandwidth;
+
+			cfs_b_p->effective_headroom_pct =
+				max_t(unsigned long,
+				      cfs_b_p->effective_headroom_pct,
+				      cfs_b_c->effective_headroom_pct);
+
+			cfs_b_p->effective_throttle_pct =
+				min_t(unsigned long,
+				      cfs_b_p->effective_throttle_pct,
+				      cfs_b_c->effective_throttle_pct);
+		}
+	}
+
+	return 0;
+}
+
+/* update target_idle_pct, down pass */
+int cpu_headroom_target_idle_pct_down(struct task_group *tg, void *data)
+{
+	struct cfs_bandwidth *cfs_b_root = &root_task_group.cfs_bandwidth;
+	unsigned long root_headroom_pct = cfs_b_root->effective_headroom_pct;
+	unsigned long root_throttle_pct = cfs_b_root->effective_throttle_pct;
+	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+	unsigned long target_idle_pct;
+
+	/* skip non-cgroup task_group and root cgroup */
+	if (!tg->css.cgroup || !tg->parent)
+		return 0;
+
+	raw_spin_lock_irq(&cfs_b->lock);
+	if (cfs_b->effective_headroom_pct == CFS_BANDWIDTH_MAX_HEADROOM)
+		target_idle_pct = 0;
+	else
+		target_idle_pct = root_headroom_pct -
+			tg->cfs_bandwidth.effective_headroom_pct;
+	raw_spin_unlock_irq(&cfs_b->lock);
+
+	tg_switch_cfs_runtime(tg, cfs_b->period, cfs_b->quota,
+			      target_idle_pct, root_throttle_pct);
+	return 0;
+}
+
+/*
+ * Calculate global max headroom_pct and throttle_pct based on
+ * effective_* values of top task_groups. This global max headroom is
+ * stored in root_task_group.
+ *
+ * If new global max headroom is different from previous settings,
+ * update target_idle_pct for all task_groups.
+ *
+ * Returns whether target_idle_pct are updated.
+ */
+static bool cpu_headroom_calculate_global_headroom(void)
+{
+	struct cfs_bandwidth *cfs_b_root = &root_task_group.cfs_bandwidth;
+	unsigned long throttle_pct = CFS_BANDWIDTH_MAX_HEADROOM;
+	unsigned long headroom_pct = 0;
+	bool update_target_idle_pct;
+	struct task_group *tg;
+
+	list_for_each_entry_rcu(tg, &root_task_group.children, siblings) {
+		struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+
+		/* skip "max", which means exempt from throttle */
+		if (cfs_b->effective_headroom_pct == CFS_BANDWIDTH_MAX_HEADROOM)
+			continue;
+		if (cfs_b->effective_headroom_pct > headroom_pct) {
+			headroom_pct = cfs_b->effective_headroom_pct;
+			throttle_pct = cfs_b->effective_throttle_pct;
+		} else if (cfs_b->effective_headroom_pct == headroom_pct) {
+			if (cfs_b->effective_throttle_pct < throttle_pct)
+				throttle_pct = cfs_b->effective_throttle_pct;
+		}
+	}
+	update_target_idle_pct =
+		(cfs_b_root->effective_headroom_pct != headroom_pct) ||
+		(cfs_b_root->effective_throttle_pct != throttle_pct);
+	cfs_b_root->effective_headroom_pct = headroom_pct;
+	cfs_b_root->effective_throttle_pct = throttle_pct;
+	if (update_target_idle_pct)
+		walk_tg_tree(cpu_headroom_target_idle_pct_down, tg_nop, NULL);
+
+	return update_target_idle_pct;
+}
+
+/*
+ * Update allowed_*, effective_*, target_idle_pct, and min_runtime_pct.
+ * This is called when cpu.headroom configuration changes.
+ *
+ * headroom_pct is how much idle cpu this tg would claim. Other tgs with
+ * lower headrooms are throttled to preserve this much idle cpu for this
+ * tg.
+ *
+ * When the system is running into the headroom (idle < headroom),
+ * throttle_pct is how much cpu _other_ tgs are throttled down to.
+ *
+ * Note that, higher headroom_pct and lower throttle_pct indicates more
+ * aggressive throttling of other task_groups. By default, each cgroup
+ * gets 0% headroom and max throttle_pct, which means no headroom. For
+ * headroom to be affective, the user has to configure both headroom and
+ * throttle_pct.
+ *
+ * Here is an example:
+ *    workload-slice: headroom_pct = 30% throttle_pct = 5%
+ *    system-slice:   headroom_pct =  0% throttle_pct = max
+ *
+ * In this configuration, system-slice will be throttled to try to give
+ * workload-slice 30%: if workload-slice uses 50% cpu, system-slice will
+ * use at most 20%. In case the system runs into the headroom, e.g.
+ * workload-slice uses 80% cpu, system-slice will use at most 5%
+ * (throttled_pct).
+ *
+ * The throttling is achieved by assigning target_idle_pct and
+ * min_runtime_pct. In this example, the setting looks like:
+ *    workload-slice: headroom_pct    = 30%  throttle_pct    = 5%
+ *                    target_idle_pct =  0%  min_runtime_pct = max
+ *    system-slice:   headroom_pct    =  0%  throttle_pct    = max
+ *                    target_idle_pct = 30%  min_runtime_pct = 5%
+ *
+ * Note that, when target_idle_pct is 0%, value of min_runtime_pct is
+ * ignored. Also, when headroom_pct is 0%, throttle_pct is ignored.
+ *
+ * headroom_pct and throttle_pct follows the following hierarchical rules.
+ *   1. task_group may not use higher headroom_pct than parent task_group;
+ *   2. task_group may not use lower throttle_pct than parent task_group;
+ *   3. headroom_pct and throttle_pct oftask_groups without directly
+ *      attached tasks are not considered effective.
+ *
+ * To follow these rules, we expand each of headroom_pct and throttle_pct
+ * into 3 variables configured_, allowed_, and effective_.
+ *
+ * configured_headroom is directly assigned by user. As a child task_group
+ * may not have higher headroom than the parent, allowed_headroom_pct is
+ * the minimum of configured_headroom_pct and parent->allowed_headroom_pct.
+ * effective_headroom_pct only considers task_groups with directly
+ * attached tasks. For task_groups with directly attached tasks,
+ * effective_headroom_pct is same as allowed_headroom_pct; for task_groups
+ * without directly attached tasks, effective_headroom_pct is the maximum
+ * of all child task_groups' effective headroom.
+ *
+ * throttle_pct follows similar logic as headroom_pct, except that
+ * throttle_pct uses minimum for where headroom_pct uses maximum, and
+ * vice versa.
+ *
+ * When headroom_pct and throttle_pct are calculated for all task_groups,
+ * we pick the highest effective_headroom_pct and corresponding
+ * effective_throttle_pct, namely, global_headroom_pct and
+ * global_throttle_pct. Then all task_groups are assigned with
+ * target_idle_pct and min_runtime_pct as:
+ *     tg->target_idle_pct =
+ *         global_headroom_pct - tg->effective_headroom_pct
+ *     tg->min_runtime_pct = global_throttle_pct
+ *
+ * Note that, tg with effective_headroom_pct equals to global_headroom_pct
+ * has target_idle_pct of 0%, which means no throttling.
+ *
+ * In summary, target_idle_pct and min_runtime_pct are calculated by the
+ * following steps:
+ *    1. Walk down tg tree and calculate allowed_* and effective_* values;
+ *    2. Walk up tg tree and calculate effective_* values;
+ *    3. Find global_headroom_pct and global_throttle_pct;
+ *    4. If necessary, update target_idle_pct and min_runtime_pct.
+ *
+ * For changes of cpu.headroom configurations, we need all these steps;
+ * for changes in task_group has_task, we only need step 2 to 4.
+ */
+static void cpu_headroom_update_config(struct task_group *tg,
+				       bool config_change)
+{
+	struct task_group *orig_tg = tg;
+
+	get_online_cpus();
+	mutex_lock(&cfs_constraints_mutex);
+	rcu_read_lock();
+
+	/*
+	 * If this is configuration change, update allowed_* and
+	 * effective_*values from this tg down
+	 */
+	if (config_change)
+		walk_tg_tree_from(tg, cpu_headroom_configure_down,
+				  cpu_headroom_configure_up, NULL);
+
+	/* Update effective_* values from this tg up */
+	while (tg) {
+		cpu_headroom_configure_up(tg, NULL);
+		tg = tg->parent;
+	}
+
+	/*
+	 * Update global headroom, and (if necessary) target_idle_pct.
+	 *
+	 * If target_idle_pct is not updated for all task_groups, at least
+	 * update it from this task_group down.
+	 */
+	if (!cpu_headroom_calculate_global_headroom())
+		walk_tg_tree_from(orig_tg, cpu_headroom_target_idle_pct_down,
+				  tg_nop, NULL);
+
+	rcu_read_unlock();
+	mutex_unlock(&cfs_constraints_mutex);
+	put_online_cpus();
+}
+
+void cfs_bandwidth_update_has_tasks_work(struct work_struct *work)
+{
+	struct cfs_bandwidth *cfs_b = container_of(work, struct cfs_bandwidth,
+						   update_has_tasks_work);
+	struct task_group *tg = container_of(cfs_b, struct task_group,
+					     cfs_bandwidth);
+
+	cpu_headroom_update_config(tg, false);
+}
+
+/*
+ * For has_task updates, no change to allowed_* values. Only update
+ * effective_* values and calculate global headroom
+ */
+static void
+cpu_cgroup_css_update_has_tasks(struct cgroup_subsys_state *css,
+				bool has_tasks)
+{
+	struct task_group *tg = css_tg(css);
+
+	/*
+	 * We held css_set_lock here, so we cannot call
+	 * cpu_headroom_update_config(), which calls mutex_lock() and
+	 * get_online_cpus(). Instead, call cpu_headroom_update_config()
+	 * in an async work.
+	 */
+	schedule_work(&tg->cfs_bandwidth.update_has_tasks_work);
+}
+
+static int cpu_headroom_show(struct seq_file *sf, void *v)
+{
+	struct task_group *tg = css_tg(seq_css(sf));
+	unsigned long val;
+
+	val = tg->cfs_bandwidth.configured_headroom_pct;
+
+	if (val == CFS_BANDWIDTH_MAX_HEADROOM)
+		seq_printf(sf, "max ");
+	else
+		seq_printf(sf, "%lu.%02lu ", LOAD_INT(val), LOAD_FRAC(val));
+
+	val = tg->cfs_bandwidth.configured_throttle_pct;
+
+	if (val == CFS_BANDWIDTH_MAX_HEADROOM)
+		seq_printf(sf, "max\n");
+	else
+		seq_printf(sf, "%lu.%02lu\n", LOAD_INT(val), LOAD_FRAC(val));
+	return 0;
+}
+
+/*
+ * Returns:
+ *    CFS_BANDWIDTH_MAX_HEADROOM for "max";
+ *    fixed point value 0.00 to 100.00 for valid numbers;
+ *    CFS_BANDWIDTH_MAX_HEADROOM + 1 for invalid input.
+ */
+static unsigned long cpu_headroom_parse_tok(char *tok)
+{
+	unsigned long val_int, val_frag;
+
+	if (strcmp(tok, "max") == 0) {
+		return CFS_BANDWIDTH_MAX_HEADROOM;
+	} else if (sscanf(tok, "%lu.%02lu", &val_int, &val_frag) == 2) {
+		goto calculate_output;
+	} else if (sscanf(tok, "%lu", &val_int) == 1) {
+		val_frag = 0;
+		goto calculate_output;
+	} else {
+		return CFS_BANDWIDTH_MAX_HEADROOM + 1;
+	}
+
+calculate_output:
+	if (val_int >= 100)
+		return CFS_BANDWIDTH_MAX_HEADROOM + 1;
+
+	return (val_int << FSHIFT) |
+		(((val_frag << FSHIFT) / 100) & (FIXED_1-1));
+}
+
+static ssize_t cpu_headroom_write(struct kernfs_open_file *of,
+				  char *buf, size_t nbytes, loff_t off)
+{
+	unsigned long headroom_pct, throttle_pct;
+	struct task_group *tg = css_tg(of_css(of));
+	char tok_a[6], tok_b[6]; /* longest valid input is 99.99 */
+
+	if (!sscanf(buf, "%5s %5s", tok_a, tok_b))
+		return -EINVAL;
+
+	headroom_pct = cpu_headroom_parse_tok(tok_a);
+	if (headroom_pct > CFS_BANDWIDTH_MAX_HEADROOM)
+		return -EINVAL;
+
+	throttle_pct = cpu_headroom_parse_tok(tok_b);
+	if (throttle_pct > CFS_BANDWIDTH_MAX_HEADROOM)
+		return -EINVAL;
+
+	tg->cfs_bandwidth.configured_headroom_pct = headroom_pct;
+	tg->cfs_bandwidth.configured_throttle_pct = throttle_pct;
+
+	cpu_headroom_update_config(tg, true);
+
+	return nbytes;
+}
 #endif
 
 static struct cftype cpu_files[] = {
@@ -7066,6 +7442,12 @@ static struct cftype cpu_files[] = {
 		.seq_show = cpu_max_show,
 		.write = cpu_max_write,
 	},
+	{
+		.name = "headroom",
+		.flags = CFTYPE_NOT_ON_ROOT,
+		.seq_show = cpu_headroom_show,
+		.write = cpu_headroom_write,
+	},
 #endif
 	{ }	/* terminate */
 };
@@ -7079,6 +7461,7 @@ struct cgroup_subsys cpu_cgrp_subsys = {
 	.fork		= cpu_cgroup_fork,
 	.can_attach	= cpu_cgroup_can_attach,
 	.attach		= cpu_cgroup_attach,
+	.css_update_has_tasks = cpu_cgroup_css_update_has_tasks,
 	.legacy_cftypes	= cpu_legacy_files,
 	.dfl_cftypes	= cpu_files,
 	.early_init	= true,

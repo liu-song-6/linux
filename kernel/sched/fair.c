@@ -4915,6 +4915,18 @@ void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
 	cfs_b->quota = RUNTIME_INF;
 	cfs_b->period = ns_to_ktime(default_cfs_period());
 
+	if (cfs_b == &root_task_group.cfs_bandwidth) {
+		/* allowed_* values for root tg */
+		cfs_b->allowed_headroom_pct = CFS_BANDWIDTH_MAX_HEADROOM;
+		cfs_b->allowed_throttle_pct = 0;
+	} else {
+		/* default configured_* values for other tg */
+		cfs_b->configured_headroom_pct = 0;
+		cfs_b->configured_throttle_pct = CFS_BANDWIDTH_MAX_HEADROOM;
+	}
+	INIT_WORK(&cfs_b->update_has_tasks_work,
+		  cfs_bandwidth_update_has_tasks_work);
+
 	INIT_LIST_HEAD(&cfs_b->throttled_cfs_rq);
 	hrtimer_init(&cfs_b->period_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED);
 	cfs_b->period_timer.function = sched_cfs_period_timer;

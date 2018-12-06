@@ -154,6 +154,8 @@ static inline void cpu_load_update_active(struct rq *this_rq) { }
  */
 #define RUNTIME_INF		((u64)~0ULL)
 
+#define CFS_BANDWIDTH_MAX_HEADROOM (200UL << FSHIFT)	/* 200% */
+
 static inline int idle_policy(int policy)
 {
 	return policy == SCHED_IDLE;
@@ -334,6 +336,10 @@ struct rt_rq;
 
 extern struct list_head task_groups;
 
+#ifdef CONFIG_CFS_BANDWIDTH
+extern void cfs_bandwidth_update_has_tasks_work(struct work_struct *work);
+#endif
+
 struct cfs_bandwidth {
 #ifdef CONFIG_CFS_BANDWIDTH
 	raw_spinlock_t		lock;
@@ -343,6 +349,26 @@ struct cfs_bandwidth {
 	s64			hierarchical_quota;
 	u64			runtime_expires;
 	int			expires_seq;
+
+	/*
+	 * The following values are all fixed-point. For more information
+	 * about these values, please refer to comments before
+	 * cpu_headroom_update_config().
+	 */
+	/* values configured by user */
+	unsigned long		configured_headroom_pct;
+	unsigned long		configured_throttle_pct;
+	/* values capped by configuration of parent group */
+	unsigned long		allowed_headroom_pct;
+	unsigned long		allowed_throttle_pct;
+	/* effective values for cgroups with tasks */
+	unsigned long		effective_headroom_pct;
+	unsigned long		effective_throttle_pct;
+	/* values calculated for runtime based throttling */
+	unsigned long		target_idle_pct;
+	unsigned long		min_runtime_pct;
+	/* work_struct to adjust settings asynchronously */
+	struct work_struct	update_has_tasks_work;
 
 	short			idle;
 	short			period_active;
