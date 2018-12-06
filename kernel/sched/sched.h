@@ -148,6 +148,8 @@ extern long calc_load_fold_active(struct rq *this_rq, long adjust);
  */
 #define RUNTIME_INF		((u64)~0ULL)
 
+#define CFS_BANDWIDTH_MAX_HEADROOM (100UL << FSHIFT)	/* 100% */
+
 static inline int idle_policy(int policy)
 {
 	return policy == SCHED_IDLE;
@@ -328,6 +330,10 @@ struct rt_rq;
 
 extern struct list_head task_groups;
 
+#ifdef CONFIG_CFS_BANDWIDTH
+extern void cfs_bandwidth_has_tasks_changed_work(struct work_struct *work);
+#endif
+
 struct cfs_bandwidth {
 #ifdef CONFIG_CFS_BANDWIDTH
 	raw_spinlock_t		lock;
@@ -350,6 +356,26 @@ struct cfs_bandwidth {
 	int			nr_periods;
 	int			nr_throttled;
 	u64			throttled_time;
+
+	/*
+	 * The following values are all fixed-point. For more information
+	 * about these values, please refer to comments before
+	 * cpu_headroom_update_config().
+	 */
+	/* values configured by user */
+	unsigned long		configured_headroom;
+	unsigned long		configured_tolerance;
+	/* values capped by configuration of parent group */
+	unsigned long		allowed_headroom;
+	unsigned long		allowed_tolerance;
+	/* effective values for cgroups with tasks */
+	unsigned long		effective_headroom;
+	unsigned long		effective_tolerance;
+	/* values calculated for runtime based throttling */
+	unsigned long		target_idle;
+	unsigned long		min_runtime;
+	/* work_struct to adjust settings asynchronously */
+	struct work_struct	has_tasks_changed_work;
 #endif
 };
 
