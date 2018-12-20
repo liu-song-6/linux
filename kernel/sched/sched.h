@@ -338,6 +338,7 @@ extern struct list_head task_groups;
 
 #ifdef CONFIG_CFS_BANDWIDTH
 extern void cfs_bandwidth_update_has_tasks_work(struct work_struct *work);
+extern const u64 min_cfs_quota_period;
 #endif
 
 struct cfs_bandwidth {
@@ -369,6 +370,9 @@ struct cfs_bandwidth {
 	unsigned long		min_runtime_pct;
 	/* work_struct to adjust settings asynchronously */
 	struct work_struct	update_has_tasks_work;
+
+	/* runtime assigned to previous period */
+	u64			prev_runtime;
 
 	short			idle;
 	short			period_active;
