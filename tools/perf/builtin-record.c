@@ -1106,6 +1106,7 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 	struct perf_data *data = &rec->data;
 	struct perf_session *session;
 	bool disabled = false, draining = false;
+	struct perf_evlist *sb_evlist = NULL;
 	int fd;
 
 	atexit(record__sig_exit);
@@ -1205,6 +1206,8 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		err = -1;
 		goto out_child;
 	}
+
+	perf_evlist__start_sb_thread(sb_evlist, &rec->opts.target);
 
 	err = record__synthesize(rec, false);
 	if (err < 0)
@@ -1456,6 +1459,8 @@ out_child:
 
 out_delete_session:
 	perf_session__delete(session);
+
+	perf_evlist__stop_sb_thread(sb_evlist);
 	return status;
 }
 

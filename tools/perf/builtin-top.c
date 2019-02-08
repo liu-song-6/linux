@@ -1524,6 +1524,7 @@ int cmd_top(int argc, const char **argv)
 			"number of thread to run event synthesize"),
 	OPT_END()
 	};
+	struct perf_evlist *sb_evlist = NULL;
 	const char * const top_usage[] = {
 		"perf top [<options>]",
 		NULL
@@ -1654,7 +1655,11 @@ int cmd_top(int argc, const char **argv)
 
 	top.record_opts.bpf_event = !top.no_bpf_event;
 
+	perf_evlist__start_sb_thread(sb_evlist, target);
+
 	status = __cmd_top(&top);
+
+	perf_evlist__stop_sb_thread(sb_evlist);
 
 out_delete_evlist:
 	perf_evlist__delete(top.evlist);
