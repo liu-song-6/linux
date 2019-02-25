@@ -1217,6 +1217,8 @@ static int __cmd_record(struct record *rec, int argc, const char **argv)
 		goto out_child;
 	}
 
+	if (!opts->no_bpf_event)
+		bpf_event__add_sb_event(&sb_evlist, &session->header.env);
 	perf_evlist__start_sb_thread(sb_evlist, &rec->opts.target);
 
 	err = record__synthesize(rec, false);
