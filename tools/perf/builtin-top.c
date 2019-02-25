@@ -1655,6 +1655,8 @@ int cmd_top(int argc, const char **argv)
 
 	top.record_opts.bpf_event = !top.no_bpf_event;
 
+	if (top.record_opts.bpf_event)
+		bpf_event__add_sb_event(&sb_evlist, &perf_env);
 	perf_evlist__start_sb_thread(sb_evlist, target);
 
 	status = __cmd_top(&top);
