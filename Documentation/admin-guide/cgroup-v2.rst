@@ -968,6 +968,20 @@ All time durations are in microseconds.
 	$PERIOD duration.  "max" for $MAX indicates no limit.  If only
 	one number is written, $MAX is updated.
 
+  cpu.headroom
+	A read-write two value file which exists on non-root cgroups.
+	The default is "0.00 max".
+
+	The idle CPU headroom claimed by the cgroup. It's is in the
+	following format::
+
+	  $HEADROOM $TOLERANCE
+
+	which indicates that other cgroups should be throttled to
+	yield $HEADROOM % idle CPU. If it is not possible to maintain
+	$HEADROOM % idle CPU, other cgroups will consume at most
+	$TOLERANCE % CPU.
+
   cpu.pressure
 	A read-only nested-key file which exists on non-root cgroups.
 
