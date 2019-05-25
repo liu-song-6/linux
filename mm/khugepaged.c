@@ -1302,9 +1302,6 @@ static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff,
 
 	i_mmap_lock_write(mapping);
 	vma_interval_tree_foreach(vma, &mapping->i_mmap, pgoff, pgoff) {
-		/* probably overkill */
-		if (vma->anon_vma)
-			continue;
 		addr = vma->vm_start + ((pgoff - vma->vm_pgoff) << PAGE_SHIFT);
 		if (addr & ~HPAGE_PMD_MASK)
 			continue;
