@@ -2132,6 +2132,8 @@ static void __split_huge_pmd_locked(struct vm_area_struct *vma, pmd_t *pmd,
 	VM_BUG_ON(!is_pmd_migration_entry(*pmd) && !pmd_trans_huge(*pmd)
 				&& !pmd_devmap(*pmd));
 
+	if (!rwsem_is_locked(&mm->mmap_sem))
+		pr_warn("%s mm->mmap_sem is not locked\n", __func__);
 	count_vm_event(THP_SPLIT_PMD);
 
 	if (!vma_is_anonymous(vma)) {

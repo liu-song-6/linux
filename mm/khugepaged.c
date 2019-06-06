@@ -58,9 +58,9 @@ enum scan_result {
 static unsigned int khugepaged_pages_to_scan __read_mostly;
 static unsigned int khugepaged_pages_collapsed;
 static unsigned int khugepaged_full_scans;
-static unsigned int khugepaged_scan_sleep_millisecs __read_mostly = 10000;
+static unsigned int khugepaged_scan_sleep_millisecs __read_mostly = 1000;
 /* during fragmentation poll the hugepage allocator once every minute */
-static unsigned int khugepaged_alloc_sleep_millisecs __read_mostly = 60000;
+static unsigned int khugepaged_alloc_sleep_millisecs __read_mostly = 6000;
 static unsigned long khugepaged_sleep_expire;
 static DEFINE_SPINLOCK(khugepaged_mm_lock);
 static DECLARE_WAIT_QUEUE_HEAD(khugepaged_wait);
@@ -1320,11 +1320,14 @@ static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff,
 			}
 			_pmd = pmdp_collapse_flush(vma, addr, pmd);
 			spin_unlock(ptl);
+			pr_info("%s done successful for mm %px\n", __func__, vma->vm_mm);
 			up_write(&vma->vm_mm->mmap_sem);
 			mm_dec_nr_ptes(vma->vm_mm);
 			pte_free(vma->vm_mm, pmd_pgtable(_pmd));
-		} else
+		} else {
 			set_bit(AS_COLLAPSE_PMD, &mapping->flags);
+			pr_info("%s down_write_trylock failed for mm %px\n", __func__, vma->vm_mm);
+		}
 	}
 	i_mmap_unlock_write(mapping);
 }
@@ -1558,9 +1561,11 @@ xa_locked:
 	xas_unlock_irq(&xas);
 xa_unlocked:
 
+	pr_info("%s: result = %d\n", __func__, result);
 	if (result == SCAN_SUCCEED) {
 		struct page *page, *tmp;
 
+		pr_info("%s: new_page = %px mapping = %px\n", __func__, new_page, new_page->mapping);
 		/*
 		 * Replacing old pages with new one has succeeded, now we
 		 * need to copy the content and free the old pages.
@@ -1737,6 +1742,8 @@ static void khugepaged_scan_file(struct mm_struct *mm,
 	}
 	rcu_read_unlock();
 
+	if (result != SCAN_PAGE_COMPOUND)
+		pr_info("%s: result = %d\n", __func__, result);
 	if (result == SCAN_SUCCEED) {
 		if (present < HPAGE_PMD_NR - khugepaged_max_ptes_none) {
 			result = SCAN_EXCEED_NONE_PTE;
