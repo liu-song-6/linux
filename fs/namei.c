@@ -3250,6 +3250,23 @@ out_dput:
 }
 
 /*
+ * The file is open for write, so it is not mmapped with VM_DENYWRITE. If
+ * it still has THP in page cache, drop the whole file from pagecache
+ * before processing writes. This helps us avoid handling write back of
+ * THP for now.
+ */
+static inline void release_file_thp(struct file *file)
+{
+	if (IS_ENABLED(CONFIG_READ_ONLY_THP_FOR_FS)) {
+		struct inode *inode = file_inode(file);
+
+		if (inode_is_open_for_write(inode) &&
+		    filemap_nr_thps(inode->i_mapping))
+			truncate_pagecache(inode, 0);
+	}
+}
+
+/*
  * Handle the last step of open()
  */
 static int do_last(struct nameidata *nd,
@@ -3418,7 +3435,11 @@ finish_open_created:
 		goto out;
 opened:
 	error = ima_file_check(file, op->acc_mode);
-	if (!error && will_truncate)
+	if (error)
+		goto out;
+
+	release_file_thp(file);
+	if (will_truncate)
 		error = handle_truncate(file);
 out:
 	if (unlikely(error > 0)) {
