@@ -1254,7 +1254,47 @@ static void collect_mm_slot(struct mm_slot *mm_slot)
 }
 
 #if defined(CONFIG_SHMEM) && defined(CONFIG_TRANSPARENT_HUGE_PAGECACHE)
-static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff)
+
+/* return whether the pmd is ready for collapse */
+static bool prepare_pmd_for_collapse(struct vm_area_struct *vma, pgoff_t pgoff,
+				     struct page *hpage, pmd_t *pmd)
+{
+	unsigned long haddr = page_address_in_vma(hpage, vma);
+	unsigned long addr;
+	int i, count = 0;
+
+	/* step 1: check all mapped PTEs are to this huge page */
+	for (i = 0, addr = haddr; i < HPAGE_PMD_NR; i++, addr += PAGE_SIZE) {
+		pte_t *pte = pte_offset_map(pmd, addr);
+
+		if (pte_none(*pte))
+			continue;
+
+		if (hpage + i != vm_normal_page(vma, addr, *pte))
+			return false;
+		count++;
+	}
+
+	/* step 2: adjust rmap */
+	for (i = 0, addr = haddr; i < HPAGE_PMD_NR; i++, addr += PAGE_SIZE) {
+		pte_t *pte = pte_offset_map(pmd, addr);
+		struct page *page;
+
+		if (pte_none(*pte))
+			continue;
+		page = vm_normal_page(vma, addr, *pte);
+		page_remove_rmap(page, false);
+	}
+
+	/* step 3: set proper refcount and mm_counters. */
+	page_ref_sub(hpage, count);
+	add_mm_counter(vma->vm_mm, mm_counter_file(hpage), -count);
+	return true;
+}
+
+extern pid_t sysctl_dump_pt_pid;
+static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff,
+				struct page *hpage)
 {
 	struct vm_area_struct *vma;
 	unsigned long addr;
@@ -1273,21 +1313,21 @@ static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff)
 		pmd = mm_find_pmd(vma->vm_mm, addr);
 		if (!pmd)
 			continue;
-		/*
-		 * We need exclusive mmap_sem to retract page table.
-		 * If trylock fails we would end up with pte-mapped THP after
-		 * re-fault. Not ideal, but it's more important to not disturb
-		 * the system too much.
-		 */
 		if (down_write_trylock(&vma->vm_mm->mmap_sem)) {
 			spinlock_t *ptl = pmd_lock(vma->vm_mm, pmd);
-			/* assume page table is clear */
+
+			if (!prepare_pmd_for_collapse(vma, pgoff, hpage, pmd)) {
+				spin_unlock(ptl);
+				up_write(&vma->vm_mm->mmap_sem);
+				continue;
+			}
 			_pmd = pmdp_collapse_flush(vma, addr, pmd);
 			spin_unlock(ptl);
 			up_write(&vma->vm_mm->mmap_sem);
 			mm_dec_nr_ptes(vma->vm_mm);
 			pte_free(vma->vm_mm, pmd_pgtable(_pmd));
-		}
+		} else
+			set_bit(AS_COLLAPSE_PMD, &mapping->flags);
 	}
 	i_mmap_unlock_write(mapping);
 }
@@ -1565,7 +1605,7 @@ xa_unlocked:
 		/*
 		 * Remove pte page tables, so we can re-fault the page as huge.
 		 */
-		retract_page_tables(mapping, start);
+		retract_page_tables(mapping, start, new_page);
 		*hpage = NULL;
 
 		khugepaged_pages_collapsed++;
@@ -1626,6 +1666,7 @@ static void khugepaged_scan_file(struct mm_struct *mm,
 	int present, swap;
 	int node = NUMA_NO_NODE;
 	int result = SCAN_SUCCEED;
+	bool collapse_pmd = false;
 
 	present = 0;
 	swap = 0;
@@ -1644,6 +1685,14 @@ static void khugepaged_scan_file(struct mm_struct *mm,
 		}
 
 		if (PageTransCompound(page)) {
+			if (collapse_pmd ||
+			    test_and_clear_bit(AS_COLLAPSE_PMD,
+					       &mapping->flags)) {
+				collapse_pmd = true;
+				retract_page_tables(mapping, start,
+						    compound_head(page));
+				continue;
+			}
 			result = SCAN_PAGE_COMPOUND;
 			break;
 		}
