@@ -44,6 +44,7 @@
 #include <linux/backing-dev.h>
 #include <linux/pagevec.h>
 #include <linux/cleancache.h>
+#include <linux/delay.h>
 
 #include "ext4.h"
 
@@ -72,6 +73,7 @@ static void mpage_end_io(struct bio *bio)
 {
 	struct bio_vec *bv;
 	struct bvec_iter_all iter_all;
+	static int count = 0;
 
 	if (ext4_bio_encrypted(bio)) {
 		if (bio->bi_status) {
@@ -84,6 +86,13 @@ static void mpage_end_io(struct bio *bio)
 	bio_for_each_segment_all(bv, bio, iter_all) {
 		struct page *page = bv->bv_page;
 
+		if (count < 40 && /* strstr(current->comm, "madv-uprobe")) { */
+		    page_file_mapping(page)->host->i_ino == 21027 &&
+		    page->index < 512) {
+			pr_info("%s mdelaying page with index %lx\n", __func__, page->index);
+			mdelay(1357);
+			count++;
+		}
 		if (!bio->bi_status) {
 			SetPageUptodate(page);
 		} else {
