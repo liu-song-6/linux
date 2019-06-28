@@ -1267,6 +1267,8 @@ static bool prepare_pmd_for_collapse(struct vm_area_struct *vma, pgoff_t pgoff,
 	for (i = 0, addr = haddr; i < HPAGE_PMD_NR; i++, addr += PAGE_SIZE) {
 		pte_t *pte = pte_offset_map(pmd, addr);
 
+		if (i < 10)
+			pr_info("%s i %d pte %px\n", __func__, i, pte);
 		if (pte_none(*pte))
 			continue;
 
@@ -1310,6 +1312,15 @@ static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff,
 		pmd = mm_find_pmd(vma->vm_mm, addr);
 		if (!pmd)
 			continue;
+		pr_info("%s: pmd = %px pmd_val(pmd) = %lx pmd_pfn(pmd) %lx\n",
+			__func__, pmd, pmd_val(*pmd), pmd_pfn(*pmd));
+		pr_info("%s: pmd_page(pmd) = %px page_address = %px\n", __func__,
+			pmd_page(*pmd), page_address(pmd_page(*pmd)));
+		pr_info("%s pmd_page_vaddr %lx pmd_to_page(pmd) %px\n", __func__,
+			pmd_page_vaddr(*pmd), pmd_to_page(pmd));
+		dump_page(pmd_page(*pmd),"pmd_page");
+		dump_page(pmd_to_page(pmd),"pmd_to_page");
+
 		if (down_write_trylock(&vma->vm_mm->mmap_sem)) {
 			spinlock_t *ptl = pmd_lock(vma->vm_mm, pmd);
 
