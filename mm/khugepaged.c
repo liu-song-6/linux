@@ -1640,16 +1640,8 @@ static void collapse_file(struct mm_struct *mm,
 			/*
 			 * khugepaged only works on read-only fd, so this
 			 * page is dirty because it hasn't been flushed
-			 * since first write. There won't be new dirty
-			 * pages.
-			 *
-			 * Trigger async flush here and hope the writeback
-			 * is done when khugepaged revisits this page.
-			 *
-			 * This is a one-off situation. We are not forcing
-			 * writeback in loop.
+			 * since first write.
 			 */
-			filemap_flush(mapping);
 			result = SCAN_FAIL;
 			goto out_unlock;
 		}
