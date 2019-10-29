@@ -1601,6 +1601,14 @@ static void collapse_file(struct mm_struct *mm,
 					result = SCAN_FAIL;
 					goto xa_unlocked;
 				}
+				if (WARN_ON_ONCE(PageDirty(page))) {
+					result = SCAN_FAIL;
+					goto out_unlock;
+				}
+			} else if (PageDirty(page)) {
+				filemap_flush(mapping);
+				result = SCAN_FAIL;
+				goto xa_locked;
 			} else if (trylock_page(page)) {
 				get_page(page);
 				xas_unlock_irq(&xas);
