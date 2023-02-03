@@ -1,0 +1,26 @@
+From b5350307bfd8eef4f4d61542927a0f6ad412511a Mon Sep 17 00:00:00 2001
+From: Song Liu <song@kernel.org>
+Date: Mon, 12 Dec 2022 15:43:05 -0800
+Subject: [PATCH] patch raid10.c for test
+
+---
+ drivers/md/raid10.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 3aa8b6e11d58..5c1e95892b93 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -4298,6 +4298,9 @@ static void raid10_free(struct mddev *mddev, void *priv)
+ {
+ 	struct r10conf *conf = priv;
+ 
++	if (!conf)
++		return;
++
+ 	mempool_exit(&conf->r10bio_pool);
+ 	safe_put_page(conf->tmppage);
+ 	kfree(conf->mirrors);
+-- 
+2.30.2
+

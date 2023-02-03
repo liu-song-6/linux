@@ -1,0 +1,25 @@
+From 63a04cc94aed8f8f10955d9e4adfe4dfefd0d987 Mon Sep 17 00:00:00 2001
+From: Song Liu <song@kernel.org>
+Date: Wed, 25 Jan 2023 14:48:35 -0800
+Subject: [PATCH] nfs dummy patch
+
+---
+ fs/nfs/write.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index 1c706465d090..cc63b129e9b4 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -450,6 +450,8 @@ nfs_destroy_unlinked_subrequests(struct nfs_page *destroy_list,
+ 				 struct nfs_page *old_head,
+ 				 struct inode *inode)
+ {
++	if (!old_head)
++		return;
+ 	while (destroy_list) {
+ 		struct nfs_page *subreq = destroy_list;
+ 
+-- 
+2.30.2
+
