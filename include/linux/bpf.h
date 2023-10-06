@@ -2472,6 +2472,13 @@ static inline bool has_current_bpf_ctx(void)
 	return !!current->bpf_ctx;
 }
 
+static inline bool bpf_dynptr_is_string(struct bpf_dynptr_kern *ptr)
+{
+	char *str = ptr->data;
+
+	return str[__bpf_dynptr_size(ptr) - 1] == '\0';
+}
+
 void notrace bpf_prog_inc_misses_counter(struct bpf_prog *prog);
 
 void bpf_dynptr_init(struct bpf_dynptr_kern *ptr, void *data,
@@ -2704,6 +2711,11 @@ static inline bool unprivileged_ebpf_enabled(void)
 }
 
 static inline bool has_current_bpf_ctx(void)
+{
+	return false;
+}
+
+static inline bool bpf_dynptr_is_string(struct bpf_dynptr_kern *ptr)
 {
 	return false;
 }
